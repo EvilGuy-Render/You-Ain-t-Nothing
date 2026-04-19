@@ -155,4 +155,29 @@ app.get("/", async (req, res) => {
 
 app.listen(PORT, () => {
     console.log("Running Advanced Browser Mode on port " + PORT);
-});
+    if (!contentType.includes("text/html")) {
+
+    const lower = contentType.toLowerCase();
+
+    // 🧠 FONT FIX (CRITICAL)
+    if (
+        lower.includes("font") ||
+        targetURL.pathname.endsWith(".woff") ||
+        targetURL.pathname.endsWith(".woff2") ||
+        targetURL.pathname.endsWith(".ttf") ||
+        targetURL.pathname.endsWith(".otf")
+    ) {
+        res.setHeader("Content-Type", contentType);
+        res.setHeader("Access-Control-Allow-Origin", "*");
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        return res.send(buffer);
+    }
+
+    // ⚡ NORMAL ASSETS (images/js/css)
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Access-Control-Allow-Origin", "*");
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return res.send(buffer);
+}
