@@ -2,7 +2,7 @@
 
 const express = require("express");
 const compression = require("compression");
-const { request } = require("undici");
+const { chromium } = require("playwright");
 
 const app = express();
 app.use(compression());
@@ -10,9 +10,52 @@ app.use(compression());
 const PORT = process.env.PORT || 10000;
 
 /* =========================
-   SIMPLE CACHE
+   BROWSER INSTANCE
 ========================= */
-const cache = new Map();
+let browser;
+
+/* launch once */
+async function getBrowser() {
+  if (browser) return browser;
+
+  browser = await chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu"
+    ]
+  });
+
+  return browser;
+}
+
+/* =========================
+   PAGE POOL (lightweight)
+========================= */
+const pages = [];
+const MAX_PAGES = 3;
+
+async function getPage() {
+  const b = await getBrowser();
+
+  let page = pages.find(p => !p.busy);
+
+  if (!page && pages.length < MAX_PAGES) {
+    page = await b.newPage();
+    pages.push(page);
+  }
+
+  if (!page) page = pages[0];
+
+  page.busy = true;
+  return page;
+}
+
+function release(page) {
+  if (page) page.busy = false;
+}
 
 /* =========================
    URL FIX
@@ -24,7 +67,9 @@ function fixUrl(url) {
     .replace("https//", "https://")
     .replace("http//", "http://");
 
-  if (!url.startsWith("http")) url = "https://" + url;
+  if (!url.startsWith("http")) {
+    url = "https://" + url;
+  }
 
   try {
     return new URL(url).toString();
@@ -34,137 +79,33 @@ function fixUrl(url) {
 }
 
 /* =========================
-   UNDICI FETCH (RETRY SAFE)
-========================= */
-async function fetch(url, attempt = 1) {
-  try {
-    return await request(url, {
-      method: "GET",
-      maxRedirections: 10,
-      headers: {
-        "user-agent": "Mozilla/5.0",
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9"
-      },
-      http2: false
-    });
-  } catch (err) {
-    if (attempt < 3) {
-      return fetch(url, attempt + 1);
-    }
-    throw err;
-  }
-}
-
-/* =========================
-   SMART ROUTE DETECTION
-========================= */
-function isAsset(url) {
-  return /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|ico)$/i.test(url);
-}
-
-function isApi(url) {
-  return url.includes("/api/") || url.includes("graphql");
-}
-
-/* =========================
    MAIN PROXY
 ========================= */
 app.get("/browse", async (req, res) => {
   const target = fixUrl(req.query.url);
-  if (!target) return res.status(400).send("Invalid URL");
 
-  const proxyBase = `${req.protocol}://${req.get("host")}/browse?url=`;
+  if (!target) {
+    return res.status(400).send("Invalid URL");
+  }
+
+  let page;
 
   try {
-    const response = await fetch(target);
+    page = await getPage();
 
-    const ct = response.headers["content-type"] || "";
-    const finalUrl = response.url || target;
+    console.log("🌐 Loading in browser:", target);
 
-    /* =========================
-       NON-HTML (assets passthrough)
-    ========================= */
-    if (!ct.includes("text/html")) {
-      const buf = await response.body.arrayBuffer();
-      res.setHeader("content-type", ct);
-      res.setHeader("access-control-allow-origin", "*");
-      return res.send(Buffer.from(buf));
-    }
+    await page.goto(target, {
+      waitUntil: "networkidle",
+      timeout: 45000
+    });
 
-    let html = await response.body.text();
+    // wait extra for JS-heavy games
+    await page.waitForTimeout(1000);
 
-    /* =========================
-       MINIMAL SAFE LINK REWRITE
-    ========================= */
-    html = html.replace(
-      /(href|src|action)=["']([^"']+)["']/gi,
-      (m, attr, link) => {
-        if (!link ||
-            link.startsWith("#") ||
-            link.startsWith("javascript:") ||
-            link.startsWith("data:") ||
-            link.startsWith("blob:")) {
-          return m;
-        }
+    const html = await page.content();
 
-        try {
-          const abs = new URL(link, finalUrl).toString();
-
-          // DON'T proxy internal API calls here (critical fix)
-          if (isApi(abs)) return m;
-
-          return `${attr}="${proxyBase + encodeURIComponent(abs)}"`;
-        } catch {
-          return m;
-        }
-      }
-    );
-
-    /* =========================
-       HYBRID FETCH PATCH (SAFE MODE)
-    ========================= */
-    const injection = `
-<script>
-(() => {
-  const PROXY = "${proxyBase}";
-
-  const realFetch = window.fetch;
-
-  window.fetch = (url, opts) => {
-    try {
-      if (typeof url === "string") {
-
-        // DO NOT break API calls
-        if (
-          url.startsWith("/api") ||
-          url.includes("graphql") ||
-          url.includes("socket")
-        ) {
-          return realFetch(url, opts);
-        }
-
-        if (url.startsWith("/")) {
-          url = location.origin + url;
-        }
-
-        if (url.startsWith("http")) {
-          url = PROXY + encodeURIComponent(url);
-        }
-      }
-    } catch {}
-
-    return realFetch(url, opts);
-  };
-})();
-</script>
-`;
-
-    html = html.includes("</head>")
-      ? html.replace("</head>", injection + "</head>")
-      : injection + html;
-
-    cache.set(target, html);
+    release(page);
 
     res.setHeader("content-type", "text/html");
     res.setHeader("access-control-allow-origin", "*");
@@ -172,7 +113,8 @@ app.get("/browse", async (req, res) => {
     return res.send(html);
 
   } catch (err) {
-    return res.status(500).send("Proxy error: " + err.toString());
+    release(page);
+    return res.status(500).send("Browser proxy error: " + err.toString());
   }
 });
 
@@ -180,12 +122,13 @@ app.get("/browse", async (req, res) => {
    ROOT
 ========================= */
 app.get("/", (req, res) => {
-  res.send("Hybrid proxy running");
+  res.send("✅ Browser relay proxy running. Use /browse?url=");
 });
 
 /* =========================
    START
 ========================= */
-app.listen(PORT, () => {
-  console.log("🔥 Hybrid proxy running on", PORT);
+app.listen(PORT, async () => {
+  await getBrowser();
+  console.log("🔥 Browser proxy running on port", PORT);
 });
