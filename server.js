@@ -2,32 +2,25 @@
 
 const express = require("express");
 const compression = require("compression");
-const { chromium } = require("playwright");
+const { request } = require("undici");
 
 const app = express();
 app.use(compression());
 
 const PORT = process.env.PORT || 10000;
 
-let browser;
-
-async function getBrowser() {
-  if (!browser) {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-      ]
-    });
-  }
-  return browser;
-}
-
+/* =========================
+   URL FIXER
+========================= */
 function fixUrl(url) {
   if (!url) return null;
-  if (!url.startsWith("http")) url = "https://" + url;
+
+  url = url.trim();
+
+  if (!url.startsWith("http")) {
+    url = "https://" + url;
+  }
+
   try {
     return new URL(url).toString();
   } catch {
@@ -35,53 +28,61 @@ function fixUrl(url) {
   }
 }
 
+/* =========================
+   ROOT
+========================= */
 app.get("/", (req, res) => {
-  res.send("Proxy running. Use /browse?url=");
+  res.send("⚡ Ultra-Fast Streaming Proxy running. Use /browse?url=");
 });
 
+/* =========================
+   STREAMING PROXY CORE
+========================= */
 app.get("/browse", async (req, res) => {
   const target = fixUrl(req.query.url);
-  if (!target) return res.status(400).send("Invalid URL");
 
-  let page;
+  if (!target) {
+    return res.status(400).send("Invalid URL");
+  }
 
   try {
-    const b = await getBrowser();
-    page = await b.newPage();
+    console.log("➡️ Streaming:", target);
 
-    await page.goto(target, {
-      waitUntil: "domcontentloaded",
-      timeout: 30000
+    const response = await request(target, {
+      method: "GET",
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9"
+      }
     });
 
-    const html = await page.content();
-    const title = await page.title();
-    const finalUrl = page.url();
+    const contentType = response.headers["content-type"] || "";
 
-    await page.close();
+    /* =========================
+       PASS HEADERS
+    ========================= */
+    res.setHeader("access-control-allow-origin", "*");
+    res.setHeader("content-type", contentType);
 
-    res.send(`
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${title}</title>
-</head>
-<body>
-<div style="padding:8px;background:#eee;font-family:Arial;">
-${finalUrl}
-</div>
-<iframe style="width:100%;height:95vh;border:none;" srcdoc="${html.replace(/"/g, "&quot;")}"></iframe>
-</body>
-</html>
-    `);
+    /* =========================
+       STREAM RAW BODY
+    ========================= */
+    if (response.body) {
+      response.body.pipe(res);
+    } else {
+      res.status(502).send("No response body");
+    }
 
   } catch (err) {
-    if (page) await page.close().catch(() => {});
     res.status(500).send("Proxy error: " + err.toString());
   }
 });
 
+/* =========================
+   START SERVER
+========================= */
 app.listen(PORT, () => {
-  console.log("Proxy running on port", PORT);
+  console.log("⚡ Ultra-fast proxy running on port", PORT);
 });
