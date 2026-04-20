@@ -70,16 +70,7 @@ async function fetchWithUndici(url, attempt = 1) {
 app.get("/browse", async (req, res) => {
   const target = fixUrl(req.query.url);
 
-  if (!target) {
-    return res.status(400).send("Invalid URL");
-  }
-
-  /* =========================
-     CACHE HIT
-  ========================= */
-  if (cache.has(target)) {
-    return res.send(cache.get(target));
-  }
+  if (!target) return res.status(400).send("Invalid URL");
 
   const proxyBase =
     req.protocol + "://" + req.get("host") + "/browse?url=";
@@ -87,8 +78,112 @@ app.get("/browse", async (req, res) => {
   try {
     const response = await fetchWithUndici(target);
 
-    const contentType =
-      response.headers["content-type"] || "";
+    const contentType = response.headers["content-type"] || "";
+
+    /* =========================
+       NON-HTML (pass-through)
+    ========================= */
+    if (!contentType.includes("text/html")) {
+      const buffer = await response.body.arrayBuffer();
+
+      res.setHeader("content-type", contentType);
+      res.setHeader("access-control-allow-origin", "*");
+
+      return res.send(Buffer.from(buffer));
+    }
+
+    let html = await response.body.text();
+
+    /* =========================
+       MINIMAL REWRITE ONLY
+       (DO NOT BREAK JS APIS)
+    ========================= */
+    html = html.replace(
+      /(href|src|action)=["'](.*?)["']/gi,
+      (match, attr, link) => {
+        if (
+          !link ||
+          link.startsWith("#") ||
+          link.startsWith("javascript:") ||
+          link.startsWith("data:") ||
+          link.startsWith("blob:")
+        ) {
+          return match;
+        }
+
+        try {
+          const abs = new URL(link, target).toString();
+
+          // IMPORTANT: only rewrite absolute navigation links
+          // NOT API endpoints or internal JS fetch calls
+          if (
+            abs.includes("/api/") ||
+            abs.includes("fetch") ||
+            abs.includes("socket")
+          ) {
+            return match;
+          }
+
+          return `${attr}="${proxyBase + encodeURIComponent(abs)}"`;
+        } catch {
+          return match;
+        }
+      }
+    );
+
+    /* =========================
+       CRITICAL FIX: preserve fetch/XHR origin
+    ========================= */
+    const injection = `
+<script>
+(() => {
+  const PROXY = "${proxyBase}";
+
+  const realFetch = window.fetch;
+
+  window.fetch = function(url, opts) {
+    try {
+      if (typeof url === "string") {
+
+        // DON'T break API calls
+        if (
+          url.startsWith("/api") ||
+          url.startsWith("/socket") ||
+          url.includes("ws")
+        ) {
+          return realFetch(url, opts);
+        }
+
+        if (!url.startsWith("http")) {
+          url = new URL(url, location.href).href;
+        }
+
+        url = PROXY + encodeURIComponent(url);
+      }
+    } catch {}
+
+    return realFetch(url, opts);
+  };
+
+})();
+</script>
+`;
+
+    if (html.includes("</head>")) {
+      html = html.replace("</head>", injection + "</head>");
+    } else {
+      html = injection + html;
+    }
+
+    res.setHeader("content-type", "text/html");
+    res.setHeader("access-control-allow-origin", "*");
+
+    return res.send(html);
+
+  } catch (err) {
+    return res.status(500).send("Proxy error: " + err.toString());
+  }
+});
 
     /* =========================
        NON-HTML (binary safe)
