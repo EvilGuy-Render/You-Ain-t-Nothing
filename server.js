@@ -1,3 +1,12 @@
+"use strict";
+
+/**
+ * 🚨 CRITICAL FIX:
+ * Forces Playwright to use Docker-bundled browsers (/ms-playwright)
+ * instead of falling back to playwright-core local paths.
+ */
+process.env.PLAYWRIGHT_BROWSERS_PATH = "/ms-playwright";
+
 const express = require("express");
 const compression = require("compression");
 const { chromium } = require("playwright");
@@ -7,19 +16,28 @@ app.use(compression());
 
 const PORT = process.env.PORT || 3000;
 
-app.get("/", async (req, res) => {
+/**
+ * Simple health check
+ */
+app.get("/", (req, res) => {
+    if (!req.query.url) {
+        return res.send("✅ Headless Proxy is running");
+    }
+});
 
+/**
+ * Main proxy route
+ */
+app.get("/browse", async (req, res) => {
     const target = req.query.url;
 
     if (!target) {
-        return res.send("Headless Browser Proxy Running");
+        return res.status(400).send("Missing ?url=");
     }
 
     let browser;
 
     try {
-
-        // 🧠 Launch Chromium (Docker-safe config)
         browser = await chromium.launch({
             headless: true,
             args: [
@@ -31,28 +49,27 @@ app.get("/", async (req, res) => {
 
         const page = await browser.newPage();
 
-        // ⚡ Load page like real browser
         await page.goto(target, {
             waitUntil: "networkidle",
             timeout: 30000
         });
 
-        // 🌐 Get fully rendered HTML (this fixes JS/UI/fonts issues)
-        const content = await page.content();
+        const html = await page.content();
 
         await browser.close();
 
         res.setHeader("Content-Type", "text/html");
-        return res.send(content);
+        return res.send(html);
 
     } catch (err) {
-
-        if (browser) await browser.close().catch(() => {});
+        if (browser) {
+            await browser.close().catch(() => {});
+        }
 
         return res.status(500).send("Proxy error: " + err.toString());
     }
 });
 
 app.listen(PORT, () => {
-    console.log("Headless proxy running on port " + PORT);
+    console.log(`🚀 Proxy running on port ${PORT}`);
 });
