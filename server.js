@@ -1,7 +1,7 @@
 "use strict";
 
 const express = require("express");
-const { chromium } = require("playwright");
+const { chromium } = require("playwright-core");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -12,25 +12,6 @@ const PORT = process.env.PORT || 10000;
 app.get("/", (req, res) => {
   res.send("✅ Proxy is running. Use /browse?url=");
 });
-
-/* =========================
-   BROWSER STATE
-========================= */
-let browser;
-
-async function getBrowser() {
-  if (!browser) {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage"
-      ]
-    });
-  }
-  return browser;
-}
 
 /* =========================
    URL FIXER
@@ -54,7 +35,26 @@ function fixUrl(url) {
 }
 
 /* =========================
-   MAIN ROUTE
+   BROWSER INIT
+========================= */
+let browser;
+
+async function getBrowser() {
+  if (!browser) {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage"
+      ]
+    });
+  }
+  return browser;
+}
+
+/* =========================
+   MAIN PROXY ROUTE
 ========================= */
 app.get("/browse", async (req, res) => {
   const target = fixUrl(req.query.url);
@@ -84,7 +84,7 @@ app.get("/browse", async (req, res) => {
       req.protocol + "://" + req.get("host") + "/browse?url=";
 
     /* =========================
-       BASIC LINK REWRITE
+       LINK REWRITER
     ========================= */
     let rewritten = html.replace(
       /(href|src|action)=["']([^"']+)["']/gi,
@@ -106,30 +106,30 @@ app.get("/browse", async (req, res) => {
     );
 
     /* =========================
-       INJECTION (FETCH PATCH)
+       JS INJECTION (FETCH + XHR)
     ========================= */
     const injection = `
 <script>
 const PROXY = "${proxyBase}";
 
-const origFetch = window.fetch;
+const originalFetch = window.fetch;
 window.fetch = function(url, opts) {
   try {
     if (typeof url === "string" && url.startsWith("http")) {
       url = PROXY + encodeURIComponent(url);
     }
   } catch {}
-  return origFetch(url, opts);
+  return originalFetch(url, opts);
 };
 
 const origOpen = XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open = function(m, url) {
+XMLHttpRequest.prototype.open = function(method, url) {
   try {
     if (url.startsWith("http")) {
       url = PROXY + encodeURIComponent(url);
     }
   } catch {}
-  return origOpen.apply(this, [m, url]);
+  return origOpen.apply(this, [method, url]);
 };
 </script>
 `;
@@ -157,7 +157,7 @@ XMLHttpRequest.prototype.open = function(m, url) {
 });
 
 /* =========================
-   START
+   START SERVER
 ========================= */
 app.listen(PORT, () => {
   console.log("🔥 Proxy running on port " + PORT);
