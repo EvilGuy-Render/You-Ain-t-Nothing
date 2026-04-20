@@ -5,8 +5,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# 🚨 FORCE BROWSER INSTALL INTO CORRECT IMAGE ENV
-RUN npx playwright install chromium --with-deps
+# 🚨 FORCE BROWSER INSTALL INSIDE IMAGE
+RUN npx playwright install chromium
 
 COPY . .
 
