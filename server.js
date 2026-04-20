@@ -1,8 +1,5 @@
 "use strict";
 
-/**
- * 🚨 Force Playwright to use Docker-bundled browsers
- */
 process.env.PLAYWRIGHT_BROWSERS_PATH = "/ms-playwright";
 
 const express = require("express");
@@ -14,101 +11,124 @@ app.use(compression());
 
 const PORT = process.env.PORT || 3000;
 
-/**
- * Health check route
- */
-app.get("/", (req, res) => {
-    res.send("✅ Proxy is running. Use /browse?url=");
-});
+/* =========================
+   PERSISTENT BROWSER (FAST MODE)
+========================= */
+let browser;
+let page;
 
-/**
- * Main browser proxy
- */
-app.get("/browse", async (req, res) => {
-    const target = req.query.url;
+/* launch ONCE */
+async function initBrowser() {
+    if (browser) return;
 
-    if (!target) {
-        return res.status(400).send("Missing ?url=");
+    browser = await chromium.launch({
+        headless: true,
+        args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu"
+        ]
+    });
+
+    page = await browser.newPage();
+}
+
+/* =========================
+   URL FIXER (IMPORTANT)
+========================= */
+function fixUrl(url) {
+    if (!url) return null;
+
+    url = url.trim()
+        .replace("https//", "https://")
+        .replace("http//", "http://");
+
+    if (!url.startsWith("http")) {
+        url = "https://" + url;
     }
 
-    let browser;
+    try {
+        return new URL(url).toString();
+    } catch {
+        return null;
+    }
+}
+
+/* =========================
+   MAIN ROUTE (REAL BROWSER MODE)
+========================= */
+app.get("/browse", async (req, res) => {
+
+    let target = fixUrl(req.query.url);
+
+    if (!target) {
+        return res.status(400).send("Invalid URL");
+    }
 
     try {
-        browser = await chromium.launch({
-            headless: true,
-            args: [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage"
-            ]
-        });
+        await initBrowser();
 
-        const page = await browser.newPage();
+        console.log("➡️ NAVIGATING:", target);
 
-        console.log("➡️ Loading:", target);
-
-        // 🌐 More reliable load strategy (fixes blank pages)
-        const response = await page.goto(target, {
+        // 🔥 reuse same tab = HUGE speed boost
+        await page.goto(target, {
             waitUntil: "domcontentloaded",
-            timeout: 60000
+            timeout: 30000
         });
 
-        // ⏳ Wait a bit for JS-heavy sites to render
-        await page.waitForTimeout(2000);
+        // wait for JS + fonts to settle slightly
+        await page.waitForTimeout(1000);
 
+        const finalUrl = page.url();
         const title = await page.title();
-        const status = response ? response.status() : "unknown";
 
-        console.log("📡 Status:", status);
-        console.log("📄 Title:", title);
-
-        const html = await page.content();
-
-        await browser.close();
-
-        // 🔥 ALWAYS RETURN SOMETHING VISIBLE (prevents “blank site” issue)
         return res.send(`
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Proxy Render</title>
-    <style>
-        body { font-family: Arial; padding: 20px; background: #fff; }
-        .box { padding: 10px; border: 1px solid #ccc; margin-bottom: 10px; }
-        iframe { width: 100%; height: 80vh; border: 1px solid #000; }
-    </style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+html, body {
+    margin:0;
+    padding:0;
+    height:100%;
+    background:#fff;
+}
+iframe {
+    width:100%;
+    height:100vh;
+    border:none;
+}
+.topbar {
+    padding:6px;
+    background:#eee;
+    font-family:Arial;
+}
+</style>
 </head>
+
 <body>
 
-<div class="box">
-    <h2>Proxy Debug Info</h2>
-    <p><b>URL:</b> ${target}</p>
-    <p><b>Status:</b> ${status}</p>
-    <p><b>Title:</b> ${title}</p>
+<div class="topbar">
+    <b>URL:</b> ${finalUrl} | <b>Title:</b> ${title}
 </div>
 
-<div class="box">
-    <h3>Rendered Page (HTML Snapshot)</h3>
-</div>
-
-<iframe srcdoc="${html.replace(/"/g, "&quot;")}"></iframe>
+<!-- REAL LIVE PAGE -->
+<iframe src="${finalUrl}"></iframe>
 
 </body>
 </html>
         `);
 
     } catch (err) {
-        if (browser) await browser.close().catch(() => {});
-
-        console.error("❌ Proxy error:", err);
-
-        return res.status(500).send(`
-            <h2>Proxy Error</h2>
-            <pre>${err.toString()}</pre>
-        `);
+        return res.status(500).send("Proxy error: " + err.toString());
     }
 });
 
+/* =========================
+   START SERVER
+========================= */
 app.listen(PORT, () => {
-    console.log("🚀 Proxy running on port", PORT);
+    console.log("🚀 Fast browser proxy running on port", PORT);
 });
