@@ -24,10 +24,10 @@ async function getBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
       "--no-first-run",
-      "--no-default-browser-check",
       "--disable-web-security",
       "--ignore-certificate-errors",
-      "--disable-extensions"
+      "--disable-extensions",
+      "--disable-gl-drawing-for-tests"  // extra speed boost (less visual overhead)
     ]
   });
 
@@ -35,7 +35,7 @@ async function getBrowser() {
 }
 
 const pages = [];
-const MAX_PAGES = 2;
+const MAX_PAGES = 1;  // lowered even more for free tier stability
 
 async function getPage() {
   const b = await getBrowser();
@@ -67,9 +67,7 @@ function fixUrl(url) {
 }
 
 const userAgents = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 ];
 
 app.get("/browse", async (req, res) => {
@@ -79,51 +77,32 @@ app.get("/browse", async (req, res) => {
   let page;
   try {
     page = await getPage();
-    console.log(`[Proxy] Loading with WS support (GoGuardian/Sophos): ${target}`);
+    console.log(`[Proxy] Loading (faster mode): ${target}`);
 
     const origin = new URL(target).origin;
-    const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
 
-    // Strong stealth (unchanged)
+    // Stealth (kept light)
     await page.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
       if (!window.chrome) window.chrome = { runtime: {}, app: { isInstalled: false } };
-      Object.defineProperty(navigator, 'permissions', {
-        get: () => ({ query: () => Promise.resolve({ state: 'granted' }) })
-      });
     });
 
     await page.setExtraHTTPHeaders({
-      'User-Agent': randomUA,
+      'User-Agent': userAgents[0],
       'Accept-Language': 'en-US,en;q=0.9'
     });
 
-    // === WEB SOCKET SUPPORT ===
-    // Route WebSockets and forward to real server when possible
-    await page.routeWebSocket(/.*/, async (ws) => {
-      console.log(`[WS] Intercepted: ${ws.url()}`);
-      const server = ws.connectToServer();   // Connect to the real target WS
-      // Forward messages both ways (basic bidirectional)
-      ws.onMessage((message) => {
-        console.log(`[WS → Server] ${message}`);
-        server.send(message);
-      });
-      server.onMessage((message) => {
-        console.log(`[Server → WS] ${message}`);
-        ws.send(message);
-      });
-      // Optional: handle close
-      ws.onClose(() => console.log(`[WS] Closed: ${ws.url()}`));
+    await page.goto(target, { 
+      waitUntil: "domcontentloaded",   // <<< MUCH FASTER than networkidle
+      timeout: 30000 
     });
 
-    await page.goto(target, { waitUntil: "networkidle", timeout: 45000 });
-    await page.waitForTimeout(2500); // extra for WS-heavy games
+    await page.waitForTimeout(800); // short wait for basic JS (games still get some time)
 
     let html = await page.content();
 
-    // Aggressive rewriting for images, CSS, scripts, WebGL assets + WS URLs
+    // Aggressive rewriting (images, CSS, assets)
     html = html.replace(
       /(src|href|action|data-src)=["']([^"']+)["']/gi,
       (match, attr, value) => {
@@ -133,7 +112,6 @@ app.get("/browse", async (req, res) => {
       }
     );
 
-    // Fix CSS url() and potential ws:// in inline scripts
     html = html.replace(
       /url\(["']?([^"')]+)["']?\)/gi,
       (match, value) => {
@@ -143,28 +121,20 @@ app.get("/browse", async (req, res) => {
       }
     );
 
-    // Optional: rewrite ws:// or wss:// to go through proxy (limited effect)
-    html = html.replace(
-      /(wss?:\/\/[^"'\s]+)/gi,
-      (match) => `/browse?url=${encodeURIComponent(match)}`
-    );
-
     release(page);
 
     res.setHeader("Content-Type", "text/html");
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST");
     res.send(html);
 
   } catch (err) {
     release(page);
     console.error(err);
-    res.status(500).send(`Proxy error: ${err.message}`);
+    res.status(500).send(`Proxy error (site may be slow or blocked): ${err.message}`);
   }
 });
 
 app.listen(PORT, async () => {
   await getBrowser();
-  console.log(`Bare proxy with WebSocket support running on port ${PORT}`);
-  console.log(`→ Use: /browse?url=https://your-target.com`);
+  console.log(`Faster bare proxy running on port ${PORT}`);
 });
