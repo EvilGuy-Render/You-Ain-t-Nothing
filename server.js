@@ -3,16 +3,12 @@
 const express = require("express");
 const compression = require("compression");
 const { chromium } = require("playwright");
-const path = require("path");
 
 const app = express();
 app.use(compression());
 
 const PORT = process.env.PORT || 10000;
 
-/* =========================
-   BROWSER INSTANCE (your original)
-========================= */
 let browser;
 
 async function getBrowser() {
@@ -24,29 +20,30 @@ async function getBrowser() {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu"
+      "--disable-gpu",
+      "--disable-blink-features=AutomationControlled",   // hides automation
+      "--disable-features=IsolateOrigins,site-per-process",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-web-security",                         // helps with some mixed content
+      "--ignore-certificate-errors"
     ]
   });
 
   return browser;
 }
 
-/* =========================
-   PAGE POOL (your original)
-========================= */
 const pages = [];
-const MAX_PAGES = 3;
+const MAX_PAGES = 2;   // keep low for Render free tier
 
 async function getPage() {
   const b = await getBrowser();
   let page = pages.find(p => !p.busy);
-
   if (!page && pages.length < MAX_PAGES) {
     page = await b.newPage();
     pages.push(page);
   }
   if (!page) page = pages[0];
-
   page.busy = true;
   return page;
 }
@@ -55,9 +52,6 @@ function release(page) {
   if (page) page.busy = false;
 }
 
-/* =========================
-   URL FIX (your original)
-========================= */
 function fixUrl(url) {
   if (!url) return null;
   url = url.trim()
@@ -71,84 +65,52 @@ function fixUrl(url) {
   }
 }
 
-/* =========================
-   ULTRAVIOLET-STYLE FRONTEND
-   (Simple but effective client-side rewriting)
-========================= */
-app.get("/", (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <title>You Ain't Nothing Proxy</title>
-      <style>
-        body { font-family: system-ui, sans-serif; background: #111; color: #0f0; text-align: center; padding: 80px 20px; }
-        h1 { margin-bottom: 10px; }
-        input { width: 520px; padding: 14px; font-size: 18px; border: 2px solid #0f0; background: #222; color: #0f0; }
-        button { padding: 14px 28px; font-size: 18px; background: #0f0; color: #111; border: none; cursor: pointer; }
-        .info { margin-top: 30px; font-size: 14px; opacity: 0.7; }
-      </style>
-    </head>
-    <body>
-      <h1>You Ain't Nothing Proxy</h1>
-      <p>Enter any URL (works best with games & modern sites)</p>
-      <form id="form">
-        <input type="text" id="urlInput" placeholder="https://example.com or just example.com" autofocus required>
-        <button type="submit">Go →</button>
-      </form>
-      <div class="info">
-        Powered by Playwright backend + client-side rewriting<br>
-        Tip: If a site still breaks, try refreshing or using a different game/site.
-      </div>
+// Random realistic User-Agent (helps against Sophos fingerprinting)
+const userAgents = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+];
 
-      <script>
-        // Simple client-side URL rewriting (UV-style)
-        const form = document.getElementById('form');
-        form.addEventListener('submit', (e) => {
-          e.preventDefault();
-          let input = document.getElementById('urlInput').value.trim();
-          if (!input) return;
-
-          if (!input.startsWith('http')) input = 'https://' + input;
-
-          // Encode the target URL and redirect to our backend with the UV prefix
-          const encoded = encodeURIComponent(input);
-          window.location.href = '/browse?url=' + encoded;
-        });
-      </script>
-    </body>
-    </html>
-  `);
-});
-
-/* =========================
-   MAIN PROXY ROUTE (your original + minor improvements)
-========================= */
 app.get("/browse", async (req, res) => {
   let target = fixUrl(req.query.url);
-  if (!target) return res.status(400).send("Invalid or missing URL");
+  if (!target) return res.status(400).send("Missing or invalid ?url= parameter");
 
   let page;
   try {
     page = await getPage();
-    console.log(`[Proxy] Loading: ${target}`);
+    console.log(`[Proxy] Loading for Sophos bypass: ${target}`);
+
+    // Apply stealth on the page
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {} };   // spoof Chrome object
+    });
+
+    const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
+
+    await page.setExtraHTTPHeaders({
+      'User-Agent': randomUA,
+      'Accept-Language': 'en-US,en;q=0.9'
+    });
 
     await page.goto(target, { 
       waitUntil: "networkidle", 
       timeout: 45000 
     });
 
-    await page.waitForTimeout(1500); // extra time for games/JS
+    await page.waitForTimeout(1500);   // give JS time to run (helps games/sites Sophos might scan)
 
     let html = await page.content();
 
-    // Basic rewriting to make links point back through your proxy
-    const baseOrigin = new URL(target).origin;
+    // Minimal rewriting to keep navigation inside proxy
+    const origin = new URL(target).origin;
     html = html.replace(
       /(href|src|action)=["']((?!https?:\/\/)[^"']+)["']/gi,
       (match, attr, value) => {
-        const full = value.startsWith('/') ? baseOrigin + value : baseOrigin + '/' + value;
+        const full = value.startsWith('/') ? origin + value : origin + '/' + value;
         return `${attr}="/browse?url=${encodeURIComponent(full)}"`;
       }
     );
@@ -157,20 +119,16 @@ app.get("/browse", async (req, res) => {
 
     res.setHeader("Content-Type", "text/html");
     res.setHeader("Access-Control-Allow-Origin", "*");
-    return res.send(html);
+    res.send(html);
 
   } catch (err) {
     release(page);
     console.error(err);
-    return res.status(500).send(`Proxy error: ${err.message}`);
+    res.status(500).send(`Proxy error (Sophos may be blocking): ${err.message}`);
   }
 });
 
-/* =========================
-   START
-========================= */
 app.listen(PORT, async () => {
   await getBrowser();
-  console.log(`✅ You Ain't Nothing Proxy running on port ${PORT}`);
-  console.log(`   → Visit http://localhost:${PORT} and enter a URL`);
+  console.log(`Bare Sophos-bypass proxy running on port ${PORT}`);
 });
