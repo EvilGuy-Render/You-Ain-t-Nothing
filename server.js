@@ -1,6 +1,4 @@
-"use strict";
 const express = require("express");
-const fetch = require("node-fetch");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -13,7 +11,7 @@ app.get("/", (req, res) => {
 });
 
 /* =========================
-   MIDDLEMAN PROXY
+   PROXY
 ========================= */
 app.get("/browse", async (req, res) => {
   try {
@@ -36,18 +34,19 @@ app.get("/browse", async (req, res) => {
     const contentType = response.headers.get("content-type") || "";
 
     /* =========================
-       NON-HTML
+       NON-HTML (files, images, etc.)
     ========================= */
     if (!contentType.includes("text/html")) {
       const buffer = await response.arrayBuffer();
 
       res.setHeader("content-type", contentType);
       res.setHeader("access-control-allow-origin", "*");
+
       return res.send(Buffer.from(buffer));
     }
 
     /* =========================
-       HTML
+       HTML PROCESSING
     ========================= */
     let html = await response.text();
 
@@ -56,15 +55,22 @@ app.get("/browse", async (req, res) => {
 
     const rewrite = (url) => {
       try {
+        if (!url) return url;
+
+        if (url.startsWith("data:") || url.startsWith("blob:")) return url;
+
         if (url.startsWith("http")) {
           return proxyBase + encodeURIComponent(url);
         }
+
         if (url.startsWith("//")) {
           return proxyBase + encodeURIComponent("https:" + url);
         }
+
         if (url.startsWith("/")) {
           return proxyBase + encodeURIComponent(origin + url);
         }
+
         return proxyBase + encodeURIComponent(origin + "/" + url);
       } catch {
         return url;
@@ -76,7 +82,7 @@ app.get("/browse", async (req, res) => {
     ========================= */
     html = html.replace(
       /(href|src|action)=["']([^"']+)["']/gi,
-      (m, attr, link) => `${attr}="${rewrite(link)}"`
+      (match, attr, link) => `${attr}="${rewrite(link)}"`
     );
 
     /* =========================
@@ -84,19 +90,21 @@ app.get("/browse", async (req, res) => {
     ========================= */
     html = html.replace(
       /url\(["']?([^"')]+)["']?\)/gi,
-      (m, link) => `url("${rewrite(link)}")`
+      (match, link) => `url("${rewrite(link)}")`
     );
 
     /* =========================
-       BASE TAG
+       ADD BASE TAG (IMPORTANT)
     ========================= */
-    html = html.replace(
-      /<head>/i,
-      `<head><base href="${proxyBase + encodeURIComponent(origin + "/")}">`
-    );
+    if (html.match(/<head>/i)) {
+      html = html.replace(
+        /<head>/i,
+        `<head><base href="${proxyBase + encodeURIComponent(origin + "/")}">`
+      );
+    }
 
     /* =========================
-       INJECTION (FETCH + XHR)
+       INJECT SCRIPT (FETCH + XHR)
     ========================= */
     const injection = `
 <script>
@@ -107,14 +115,17 @@ const originalFetch = window.fetch;
 window.fetch = function(url, options) {
   try {
     if (typeof url === "string") {
+
       if (url.startsWith("/")) {
         url = location.origin + url;
       }
+
       if (url.startsWith("http")) {
         url = PROXY + encodeURIComponent(url);
       }
     }
   } catch {}
+
   return originalFetch(url, options);
 };
 
@@ -122,13 +133,17 @@ window.fetch = function(url, options) {
 const origOpen = XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open = function(method, url) {
   try {
+
     if (url.startsWith("/")) {
       url = location.origin + url;
     }
+
     if (url.startsWith("http")) {
       url = PROXY + encodeURIComponent(url);
     }
+
   } catch {}
+
   return origOpen.apply(this, [method, url]);
 };
 </script>
