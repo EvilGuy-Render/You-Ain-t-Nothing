@@ -5,9 +5,6 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install
 
-# 🚨 FORCE BROWSER INSTALL INSIDE IMAGE
-RUN npx playwright install chromium
-
 COPY . .
 
 EXPOSE 3000
