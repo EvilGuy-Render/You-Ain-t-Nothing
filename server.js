@@ -93,12 +93,124 @@ function fixUrl(url) {
    MAIN ROUTE
 ========================= */
 app.get("/browse", async (req, res) => {
+  try {
+    let target = req.query.url;
+    if (!target) return res.send("Missing url");
 
-    const target = fixUrl(req.query.url);
-
-    if (!target) {
-        return res.status(400).send("Invalid URL");
+    if (!target.startsWith("http")) {
+      target = "https://" + target;
     }
+
+    const response = await fetch(target, {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
+
+    const contentType = response.headers.get("content-type") || "";
+
+    // =========================
+    // NON-HTML (PASS THROUGH)
+    // =========================
+    if (!contentType.includes("text/html")) {
+      const buffer = await response.arrayBuffer();
+
+      res.setHeader("content-type", contentType);
+      return res.send(Buffer.from(buffer));
+    }
+
+    // =========================
+    // HTML PROCESSING
+    // =========================
+    let html = await response.text();
+
+    const origin = new URL(target).origin;
+    const proxyBase = "/browse?url=";
+
+    const rewrite = (url) => {
+      try {
+        if (url.startsWith("http")) {
+          return proxyBase + encodeURIComponent(url);
+        }
+        if (url.startsWith("//")) {
+          return proxyBase + encodeURIComponent("https:" + url);
+        }
+        if (url.startsWith("/")) {
+          return proxyBase + encodeURIComponent(origin + url);
+        }
+        return proxyBase + encodeURIComponent(origin + "/" + url);
+      } catch {
+        return url;
+      }
+    };
+
+    // =========================
+    // REWRITE HTML LINKS
+    // =========================
+    html = html.replace(
+      /(href|src|action)=["']([^"']+)["']/gi,
+      (m, attr, link) => `${attr}="${rewrite(link)}"`
+    );
+
+    // =========================
+    // REWRITE CSS url()
+    // =========================
+    html = html.replace(
+      /url\(["']?([^"')]+)["']?\)/gi,
+      (m, link) => `url("${rewrite(link)}")`
+    );
+
+    // =========================
+    // 🔥 INJECT MIDDLEMAN PATCH
+    // =========================
+    html = html.replace(
+      "<head>",
+      `<head>
+<script>
+
+/* =========================
+   FETCH PATCH
+========================= */
+const originalFetch = window.fetch;
+window.fetch = function(url, options) {
+  try {
+    if (typeof url === "string" && url.startsWith("http")) {
+      url = "/browse?url=" + encodeURIComponent(url);
+    }
+  } catch {}
+  return originalFetch(url, options);
+};
+
+/* =========================
+   XHR PATCH
+========================= */
+const origOpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(method, url) {
+  try {
+    if (url.startsWith("http")) {
+      url = "/browse?url=" + encodeURIComponent(url);
+    }
+  } catch {}
+  return origOpen.apply(this, [method, url]);
+};
+
+</script>`
+    );
+
+    // =========================
+    // REMOVE BLOCKERS
+    // =========================
+    res.setHeader("content-type", "text/html");
+    res.setHeader("access-control-allow-origin", "*");
+    res.removeHeader("content-security-policy");
+    res.removeHeader("x-frame-options");
+
+    res.send(html);
+
+  } catch (err) {
+    res.send("Proxy error: " + err.toString());
+  }
+});
 
     /* =========================
        CACHE HIT (INSTANT LOAD)
