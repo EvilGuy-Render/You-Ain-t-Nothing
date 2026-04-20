@@ -1,291 +1,163 @@
+"use strict";
+
 const express = require("express");
+const { chromium } = require("playwright");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
 /* =========================
-   ROOT (TEST)
+   ROOT
 ========================= */
 app.get("/", (req, res) => {
   res.send("✅ Proxy is running. Use /browse?url=");
 });
 
 /* =========================
-   PROXY
+   BROWSER STATE
+========================= */
+let browser;
+
+async function getBrowser() {
+  if (!browser) {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage"
+      ]
+    });
+  }
+  return browser;
+}
+
+/* =========================
+   URL FIXER
+========================= */
+function fixUrl(url) {
+  if (!url) return null;
+
+  url = url.trim()
+    .replace("https//", "https://")
+    .replace("http//", "http://");
+
+  if (!url.startsWith("http")) {
+    url = "https://" + url;
+  }
+
+  try {
+    return new URL(url).toString();
+  } catch {
+    return null;
+  }
+}
+
+/* =========================
+   MAIN ROUTE
 ========================= */
 app.get("/browse", async (req, res) => {
+  const target = fixUrl(req.query.url);
 
-    const target = fixUrl(req.query.url);
+  if (!target) {
+    return res.status(400).send("Invalid URL");
+  }
 
-    if (!target) {
-        return res.status(400).send("Invalid URL");
-    }
+  let context;
+  let page;
 
-    let page;
+  try {
+    const b = await getBrowser();
+    context = await b.newContext();
+    page = await context.newPage();
 
-    try {
-        page = await getPage();
+    console.log("➡️ Loading:", target);
 
-        console.log("➡️ Rendering:", target);
+    await page.goto(target, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000
+    });
 
-        await page.goto(target, {
-            waitUntil: "domcontentloaded",
-            timeout: 30000
-        });
-
-        await page.waitForLoadState("networkidle").catch(() => {});
-
-        const html = await page.content();
-
-        /* =========================
-           CRITICAL: rewrite links
-           so browser never leaves proxy
-        ========================= */
-        const rewritten = html
-            .replace(/href="\/(.*?)"/g, `href="/browse?url=${target}/$1"`)
-            .replace(/src="\/(.*?)"/g, `src="/browse?url=${target}/$1"`);
-
-        releasePage(page);
-
-        return res.send(rewritten);
-
-    } catch (err) {
-        releasePage(page);
-        return res.status(500).send("Proxy error: " + err.toString());
-    }
-});
-
-    const contentType = response.headers.get("content-type") || "";
-
-    /* =========================
-       NON-HTML
-    ========================= */
-    if (!contentType.includes("text/html")) {
-      const buffer = await response.arrayBuffer();
-
-      res.setHeader("content-type", contentType);
-      res.setHeader("access-control-allow-origin", "*");
-
-      return res.send(Buffer.from(buffer));
-    }
-
-    /* =========================
-       HTML
-    ========================= */
-    let html = await response.text();
+    const html = await page.content();
 
     const proxyBase =
       req.protocol + "://" + req.get("host") + "/browse?url=";
 
     /* =========================
-       LIGHT REWRITE ONLY (SAFE)
+       BASIC LINK REWRITE
     ========================= */
-    html = html.replace(
-      /(href|action)=["']([^"']+)["']/gi,
+    let rewritten = html.replace(
+      /(href|src|action)=["']([^"']+)["']/gi,
       (match, attr, link) => {
-        if (link.startsWith("#") || link.startsWith("javascript:")) {
+        if (
+          link.startsWith("#") ||
+          link.startsWith("javascript:") ||
+          link.startsWith("data:") ||
+          link.startsWith("blob:")
+        ) return match;
+
+        try {
+          const abs = new URL(link, target).href;
+          return `${attr}="${proxyBase + encodeURIComponent(abs)}"`;
+        } catch {
           return match;
         }
-
-        if (!link.startsWith("http")) {
-          try {
-            link = new URL(link, target).href;
-          } catch {}
-        }
-
-        return `${attr}="${proxyBase + encodeURIComponent(link)}"`;
       }
     );
 
     /* =========================
-       INJECTION (MAIN FIX)
+       INJECTION (FETCH PATCH)
     ========================= */
     const injection = `
 <script>
 const PROXY = "${proxyBase}";
 
-/* FETCH PATCH */
-const originalFetch = window.fetch;
-window.fetch = function(url, options) {
+const origFetch = window.fetch;
+window.fetch = function(url, opts) {
   try {
-    if (typeof url === "string") {
-      if (!url.startsWith("blob:") && !url.startsWith("data:")) {
-        url = new URL(url, location.href).href;
-        url = PROXY + encodeURIComponent(url);
-      }
+    if (typeof url === "string" && url.startsWith("http")) {
+      url = PROXY + encodeURIComponent(url);
     }
   } catch {}
-  return originalFetch(url, options);
+  return origFetch(url, opts);
 };
 
-/* XHR PATCH */
 const origOpen = XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open = function(method, url) {
+XMLHttpRequest.prototype.open = function(m, url) {
   try {
-    url = new URL(url, location.href).href;
-    url = PROXY + encodeURIComponent(url);
-  } catch {}
-  return origOpen.apply(this, [method, url]);
-};
-</script>
-`;
-
-    if (html.includes("<head>")) {
-      html = html.replace("<head>", `<head>${injection}`);
-    } else {
-      html = injection + html;
-    }
-
-    /* =========================
-       HEADERS
-    ========================= */
-    res.setHeader("content-type", "text/html");
-    res.setHeader("access-control-allow-origin", "*");
-
-    res.send(html);
-
-  } catch (err) {
-    res.send("Proxy error: " + err.toString());
-  }
-});
-
-    /* =========================
-       NON-HTML (files, images, etc.)
-    ========================= */
-    if (!contentType.includes("text/html")) {
-      const buffer = await response.arrayBuffer();
-
-      res.setHeader("content-type", contentType);
-      res.setHeader("access-control-allow-origin", "*");
-
-      return res.send(Buffer.from(buffer));
-    }
-
-    /* =========================
-       HTML PROCESSING
-    ========================= */
-    let html = await response.text();
-
-    const proxyBase =
-      req.protocol + "://" + req.get("host") + "/browse?url=";
-
-    const rewrite = (url) => {
-      try {
-        if (!url) return url;
-
-        if (url.startsWith("data:") || url.startsWith("blob:")) return url;
-
-        if (url.startsWith("http")) {
-          return proxyBase + encodeURIComponent(url);
-        }
-
-        if (url.startsWith("//")) {
-          return proxyBase + encodeURIComponent("https:" + url);
-        }
-
-        if (url.startsWith("/")) {
-          return proxyBase + encodeURIComponent(origin + url);
-        }
-
-        return proxyBase + encodeURIComponent(origin + "/" + url);
-      } catch {
-        return url;
-      }
-    };
-
-    /* =========================
-       REWRITE HTML ATTRIBUTES
-    ========================= */
-    html = html.replace(
-      /(href|src|action)=["']([^"']+)["']/gi,
-      (match, attr, link) => `${attr}="${rewrite(link)}"`
-    );
-
-    /* =========================
-       REWRITE CSS url()
-    ========================= */
-    html = html.replace(
-      /url\(["']?([^"')]+)["']?\)/gi,
-      (match, link) => `url("${rewrite(link)}")`
-    );
-
-    /* =========================
-       ADD BASE TAG (IMPORTANT)
-    ========================= */
-    if (html.match(/<head>/i)) {
-      html = html.replace(
-        /<head>/i,
-        `<head><base href="${proxyBase + encodeURIComponent(origin + "/")}">`
-      );
-    }
-
-    /* =========================
-       INJECT SCRIPT (FETCH + XHR)
-    ========================= */
-    const injection = `
-<script>
-const PROXY = "${proxyBase}";
-
-/* FETCH PATCH */
-const originalFetch = window.fetch;
-window.fetch = function(url, options) {
-  try {
-    if (typeof url === "string") {
-
-      if (url.startsWith("/")) {
-        url = location.origin + url;
-      }
-
-      if (url.startsWith("http")) {
-        url = PROXY + encodeURIComponent(url);
-      }
-    }
-  } catch {}
-
-  return originalFetch(url, options);
-};
-
-/* XHR PATCH */
-const origOpen = XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open = function(method, url) {
-  try {
-
-    if (url.startsWith("/")) {
-      url = location.origin + url;
-    }
-
     if (url.startsWith("http")) {
       url = PROXY + encodeURIComponent(url);
     }
-
   } catch {}
-
-  return origOpen.apply(this, [method, url]);
+  return origOpen.apply(this, [m, url]);
 };
 </script>
 `;
 
-    if (html.includes("<head>")) {
-      html = html.replace("<head>", `<head>${injection}`);
+    if (rewritten.includes("</head>")) {
+      rewritten = rewritten.replace("</head>", injection + "</head>");
     } else {
-      html = injection + html;
+      rewritten = injection + rewritten;
     }
 
-    /* =========================
-       HEADERS
-    ========================= */
-    res.setHeader("content-type", "text/html");
-    res.setHeader("access-control-allow-origin", "*");
+    await page.close();
+    await context.close();
 
-    res.send(html);
+    res.setHeader("content-type", "text/html");
+    return res.send(rewritten);
 
   } catch (err) {
-    res.send("Proxy error: " + err.toString());
+    try {
+      if (page) await page.close();
+      if (context) await context.close();
+    } catch {}
+
+    return res.status(500).send("Proxy error: " + err.toString());
   }
 });
 
 /* =========================
-   START SERVER
+   START
 ========================= */
 app.listen(PORT, () => {
   console.log("🔥 Proxy running on port " + PORT);
