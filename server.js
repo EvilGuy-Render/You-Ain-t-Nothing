@@ -27,7 +27,8 @@ async function getBrowser() {
       "--disable-web-security",
       "--ignore-certificate-errors",
       "--disable-extensions",
-      "--disable-gl-drawing-for-tests"  // extra speed boost (less visual overhead)
+      "--disable-gl-drawing-for-tests",
+      "--disable-background-networking"  // reduce extra requests
     ]
   });
 
@@ -35,7 +36,7 @@ async function getBrowser() {
 }
 
 const pages = [];
-const MAX_PAGES = 1;  // lowered even more for free tier stability
+const MAX_PAGES = 1;  // minimal for stability
 
 async function getPage() {
   const b = await getBrowser();
@@ -66,10 +67,6 @@ function fixUrl(url) {
   }
 }
 
-const userAgents = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-];
-
 app.get("/browse", async (req, res) => {
   let target = fixUrl(req.query.url);
   if (!target) return res.status(400).send("Missing or invalid ?url= parameter");
@@ -77,32 +74,51 @@ app.get("/browse", async (req, res) => {
   let page;
   try {
     page = await getPage();
-    console.log(`[Proxy] Loading (faster mode): ${target}`);
+    console.log(`[Proxy] Loading with extra GoGuardian stealth: ${target}`);
 
     const origin = new URL(target).origin;
 
-    // Stealth (kept light)
+    // Extra stealth for GoGuardian / managed Chromebooks
     await page.addInitScript(() => {
+      // Core patches
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
       if (!window.chrome) window.chrome = { runtime: {}, app: { isInstalled: false } };
+
+      // Spoof more properties
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+      Object.defineProperty(screen, 'width', { get: () => 1920 });
+      Object.defineProperty(screen, 'height', { get: () => 1080 });
+      Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+      Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+
+      // Random small mouse movement simulation (human-like)
+      setTimeout(() => {
+        if (window.dispatchEvent) {
+          const event = new MouseEvent('mousemove', { clientX: Math.random() * 100, clientY: Math.random() * 100 });
+          document.dispatchEvent(event);
+        }
+      }, 300);
     });
 
+    // Realistic context
+    await page.setViewportSize({ width: 1280, height: 720 });
     await page.setExtraHTTPHeaders({
-      'User-Agent': userAgents[0],
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
       'Accept-Language': 'en-US,en;q=0.9'
     });
 
     await page.goto(target, { 
-      waitUntil: "domcontentloaded",   // <<< MUCH FASTER than networkidle
-      timeout: 30000 
+      waitUntil: "domcontentloaded", 
+      timeout: 25000 
     });
 
-    await page.waitForTimeout(800); // short wait for basic JS (games still get some time)
+    await page.waitForTimeout(600 + Math.random() * 400); // slight random delay
 
     let html = await page.content();
 
-    // Aggressive rewriting (images, CSS, assets)
+    // Rewriting (images, CSS, assets)
     html = html.replace(
       /(src|href|action|data-src)=["']([^"']+)["']/gi,
       (match, attr, value) => {
@@ -130,11 +146,11 @@ app.get("/browse", async (req, res) => {
   } catch (err) {
     release(page);
     console.error(err);
-    res.status(500).send(`Proxy error (site may be slow or blocked): ${err.message}`);
+    res.status(500).send(`Proxy error: ${err.message}`);
   }
 });
 
 app.listen(PORT, async () => {
   await getBrowser();
-  console.log(`Faster bare proxy running on port ${PORT}`);
+  console.log(`GoGuardian-hardened bare proxy running on port ${PORT}`);
 });
