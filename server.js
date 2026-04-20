@@ -22,9 +22,6 @@ app.get("/browse", async (req, res) => {
       target = "https://" + target;
     }
 
-    const targetURL = new URL(target);
-    const origin = targetURL.origin;
-
     const response = await fetch(target, {
       headers: {
         "User-Agent": "Mozilla/5.0"
@@ -32,6 +29,98 @@ app.get("/browse", async (req, res) => {
     });
 
     const contentType = response.headers.get("content-type") || "";
+
+    /* =========================
+       NON-HTML
+    ========================= */
+    if (!contentType.includes("text/html")) {
+      const buffer = await response.arrayBuffer();
+
+      res.setHeader("content-type", contentType);
+      res.setHeader("access-control-allow-origin", "*");
+
+      return res.send(Buffer.from(buffer));
+    }
+
+    /* =========================
+       HTML
+    ========================= */
+    let html = await response.text();
+
+    const proxyBase =
+      req.protocol + "://" + req.get("host") + "/browse?url=";
+
+    /* =========================
+       LIGHT REWRITE ONLY (SAFE)
+    ========================= */
+    html = html.replace(
+      /(href|action)=["']([^"']+)["']/gi,
+      (match, attr, link) => {
+        if (link.startsWith("#") || link.startsWith("javascript:")) {
+          return match;
+        }
+
+        if (!link.startsWith("http")) {
+          try {
+            link = new URL(link, target).href;
+          } catch {}
+        }
+
+        return `${attr}="${proxyBase + encodeURIComponent(link)}"`;
+      }
+    );
+
+    /* =========================
+       INJECTION (MAIN FIX)
+    ========================= */
+    const injection = `
+<script>
+const PROXY = "${proxyBase}";
+
+/* FETCH PATCH */
+const originalFetch = window.fetch;
+window.fetch = function(url, options) {
+  try {
+    if (typeof url === "string") {
+      if (!url.startsWith("blob:") && !url.startsWith("data:")) {
+        url = new URL(url, location.href).href;
+        url = PROXY + encodeURIComponent(url);
+      }
+    }
+  } catch {}
+  return originalFetch(url, options);
+};
+
+/* XHR PATCH */
+const origOpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(method, url) {
+  try {
+    url = new URL(url, location.href).href;
+    url = PROXY + encodeURIComponent(url);
+  } catch {}
+  return origOpen.apply(this, [method, url]);
+};
+</script>
+`;
+
+    if (html.includes("<head>")) {
+      html = html.replace("<head>", `<head>${injection}`);
+    } else {
+      html = injection + html;
+    }
+
+    /* =========================
+       HEADERS
+    ========================= */
+    res.setHeader("content-type", "text/html");
+    res.setHeader("access-control-allow-origin", "*");
+
+    res.send(html);
+
+  } catch (err) {
+    res.send("Proxy error: " + err.toString());
+  }
+});
 
     /* =========================
        NON-HTML (files, images, etc.)
