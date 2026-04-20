@@ -14,19 +14,46 @@ app.get("/", (req, res) => {
    PROXY
 ========================= */
 app.get("/browse", async (req, res) => {
-  try {
-    let target = req.query.url;
-    if (!target) return res.send("Missing url");
 
-    if (!target.startsWith("http")) {
-      target = "https://" + target;
+    const target = fixUrl(req.query.url);
+
+    if (!target) {
+        return res.status(400).send("Invalid URL");
     }
 
-    const response = await fetch(target, {
-      headers: {
-        "User-Agent": "Mozilla/5.0"
-      }
-    });
+    let page;
+
+    try {
+        page = await getPage();
+
+        console.log("➡️ Rendering:", target);
+
+        await page.goto(target, {
+            waitUntil: "domcontentloaded",
+            timeout: 30000
+        });
+
+        await page.waitForLoadState("networkidle").catch(() => {});
+
+        const html = await page.content();
+
+        /* =========================
+           CRITICAL: rewrite links
+           so browser never leaves proxy
+        ========================= */
+        const rewritten = html
+            .replace(/href="\/(.*?)"/g, `href="/browse?url=${target}/$1"`)
+            .replace(/src="\/(.*?)"/g, `src="/browse?url=${target}/$1"`);
+
+        releasePage(page);
+
+        return res.send(rewritten);
+
+    } catch (err) {
+        releasePage(page);
+        return res.status(500).send("Proxy error: " + err.toString());
+    }
+});
 
     const contentType = response.headers.get("content-type") || "";
 
