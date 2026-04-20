@@ -1,7 +1,5 @@
 "use strict";
 
-process.env.PLAYWRIGHT_BROWSERS_PATH = "/ms-playwright";
-
 const express = require("express");
 const compression = require("compression");
 const { chromium } = require("playwright");
@@ -12,12 +10,20 @@ app.use(compression());
 const PORT = process.env.PORT || 3000;
 
 /* =========================
-   PERSISTENT BROWSER (FAST MODE)
+   SPEED CACHE
+========================= */
+const cache = new Map();
+
+/* =========================
+   BROWSER + PAGE POOL
 ========================= */
 let browser;
-let page;
+let pages = [];
+const MAX_PAGES = 4;
 
-/* launch ONCE */
+/* =========================
+   LAUNCH BROWSER ONCE
+========================= */
 async function initBrowser() {
     if (browser) return;
 
@@ -27,15 +33,43 @@ async function initBrowser() {
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
-            "--disable-gpu"
+            "--disable-gpu",
+
+            // ⚡ SPEED BOOST FLAGS
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding"
         ]
     });
-
-    page = await browser.newPage();
 }
 
 /* =========================
-   URL FIXER (IMPORTANT)
+   PAGE POOL SYSTEM
+========================= */
+async function getPage() {
+    await initBrowser();
+
+    let page = pages.find(p => !p.busy);
+
+    if (!page && pages.length < MAX_PAGES) {
+        page = await browser.newPage();
+        pages.push(page);
+    }
+
+    if (!page) {
+        page = pages[0];
+    }
+
+    page.busy = true;
+    return page;
+}
+
+function releasePage(page) {
+    if (page) page.busy = false;
+}
+
+/* =========================
+   URL FIXER (ROBUST)
 ========================= */
 function fixUrl(url) {
     if (!url) return null;
@@ -56,34 +90,41 @@ function fixUrl(url) {
 }
 
 /* =========================
-   MAIN ROUTE (REAL BROWSER MODE)
+   MAIN ROUTE
 ========================= */
 app.get("/browse", async (req, res) => {
 
-    let target = fixUrl(req.query.url);
+    const target = fixUrl(req.query.url);
 
     if (!target) {
         return res.status(400).send("Invalid URL");
     }
 
+    /* =========================
+       CACHE HIT (INSTANT LOAD)
+    ========================= */
+    if (cache.has(target)) {
+        return res.send(cache.get(target));
+    }
+
+    let page;
+
     try {
-        await initBrowser();
+        page = await getPage();
 
-        console.log("➡️ NAVIGATING:", target);
+        console.log("➡️ Loading:", target);
 
-        // 🔥 reuse same tab = HUGE speed boost
         await page.goto(target, {
             waitUntil: "domcontentloaded",
-            timeout: 30000
+            timeout: 20000
         });
 
-        // wait for JS + fonts to settle slightly
-        await page.waitForTimeout(1000);
+        await page.waitForLoadState("domcontentloaded").catch(() => {});
 
         const finalUrl = page.url();
         const title = await page.title();
 
-        return res.send(`
+        const html = `
 <!DOCTYPE html>
 <html>
 <head>
@@ -102,8 +143,9 @@ iframe {
 }
 .topbar {
     padding:6px;
-    background:#eee;
     font-family:Arial;
+    background:#eee;
+    font-size:14px;
 }
 </style>
 </head>
@@ -111,17 +153,28 @@ iframe {
 <body>
 
 <div class="topbar">
-    <b>URL:</b> ${finalUrl} | <b>Title:</b> ${title}
+    URL: ${finalUrl} | Title: ${title}
 </div>
 
-<!-- REAL LIVE PAGE -->
 <iframe src="${finalUrl}"></iframe>
 
 </body>
 </html>
-        `);
+        `;
+
+        /* =========================
+           CACHE RESULT
+        ========================= */
+        cache.set(target, html);
+
+        releasePage(page);
+
+        return res.send(html);
 
     } catch (err) {
+
+        releasePage(page);
+
         return res.status(500).send("Proxy error: " + err.toString());
     }
 });
@@ -130,5 +183,5 @@ iframe {
    START SERVER
 ========================= */
 app.listen(PORT, () => {
-    console.log("🚀 Fast browser proxy running on port", PORT);
+    console.log("🚀 Fast proxy running on port", PORT);
 });
