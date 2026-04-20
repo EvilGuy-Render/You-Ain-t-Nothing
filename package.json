@@ -1,5 +1,5 @@
 {
-  "name": "proxy",
+  "name": "fast-proxy",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
@@ -9,6 +9,6 @@
   "dependencies": {
     "express": "^4.19.2",
     "compression": "^1.7.4",
-    "playwright": "1.59.1"
+    "undici": "^6.19.8"
   }
 }
