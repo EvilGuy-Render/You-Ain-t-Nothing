@@ -3,7 +3,6 @@
 const express = require("express");
 const compression = require("compression");
 const { chromium } = require("playwright");
-const { request } = require("undici");
 
 const app = express();
 app.use(compression());
@@ -52,44 +51,11 @@ function fixUrl(url) {
 }
 
 /* =========================
-   🔥 RAW STREAM (CRITICAL)
-========================= */
-app.get("/raw", async (req, res) => {
-  const target = fixUrl(req.query.url);
-  if (!target) return res.status(400).send("Bad URL");
-
-  try {
-    const upstream = await request(target, {
-      method: "GET",
-      headers: {
-        "user-agent": "Mozilla/5.0",
-        "accept": "*/*"
-      }
-    });
-
-    res.setHeader(
-      "content-type",
-      upstream.headers["content-type"] || "application/octet-stream"
-    );
-
-    res.setHeader("access-control-allow-origin", "*");
-
-    upstream.body.pipe(res);
-
-  } catch (err) {
-    res.status(500).send("RAW error: " + err.toString());
-  }
-});
-
-/* =========================
-   MAIN BROWSER ROUTE
+   MAIN ROUTE
 ========================= */
 app.get("/browse", async (req, res) => {
   const target = fixUrl(req.query.url);
   if (!target) return res.status(400).send("Invalid URL");
-
-  const proxyBase =
-    req.protocol + "://" + req.get("host");
 
   let page;
 
@@ -97,15 +63,39 @@ app.get("/browse", async (req, res) => {
     const browser = await getBrowser();
     page = await browser.newPage();
 
+    const origin = new URL(target).origin;
+
+    /* =========================
+       INTERCEPT EVERYTHING
+       (this replaces undici)
+    ========================= */
+    await page.route("**/*", async (route) => {
+      try {
+        const request = route.request();
+
+        const response = await page.request.fetch(request);
+
+        const headers = response.headers();
+
+        route.fulfill({
+          status: response.status(),
+          headers,
+          body: await response.body()
+        });
+      } catch (err) {
+        route.continue();
+      }
+    });
+
     await page.goto(target, {
       waitUntil: "domcontentloaded",
-      timeout: 25000
+      timeout: 30000
     });
 
     let html = await page.content();
 
     /* =========================
-       REWRITE EVERYTHING → /raw
+       BASIC REWRITE
     ========================= */
     html = html.replace(
       /(src|href|action)=["']([^"']+)["']/gi,
@@ -119,66 +109,12 @@ app.get("/browse", async (req, res) => {
 
         try {
           const abs = new URL(link, target).toString();
-          return `${attr}="${proxyBase}/raw?url=${encodeURIComponent(abs)}"`;
+          return `${attr}="/browse?url=${encodeURIComponent(abs)}"`;
         } catch {
           return match;
         }
       }
     );
-
-    /* =========================
-       CSS url()
-    ========================= */
-    html = html.replace(
-      /url\(["']?([^"')]+)["']?\)/gi,
-      (match, link) => {
-        if (link.startsWith("data:")) return match;
-
-        try {
-          const abs = new URL(link, target).toString();
-          return `url("${proxyBase}/raw?url=${encodeURIComponent(abs)}")`;
-        } catch {
-          return match;
-        }
-      }
-    );
-
-    /* =========================
-       FETCH/XHR FIX (CRITICAL)
-    ========================= */
-    const injection = `
-<script>
-const RAW = "${proxyBase}/raw?url=";
-
-const origFetch = window.fetch;
-window.fetch = function(url, opts) {
-  try {
-    if (typeof url === "string") {
-      if (!url.startsWith("data:") && !url.startsWith("blob:")) {
-        url = new URL(url, location.href).href;
-        url = RAW + encodeURIComponent(url);
-      }
-    }
-  } catch {}
-  return origFetch(url, opts);
-};
-
-const origOpen = XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open = function(method, url) {
-  try {
-    url = new URL(url, location.href).href;
-    url = RAW + encodeURIComponent(url);
-  } catch {}
-  return origOpen.apply(this, [method, url]);
-};
-</script>
-`;
-
-    if (html.includes("</head>")) {
-      html = html.replace("</head>", injection + "</head>");
-    } else {
-      html = injection + html;
-    }
 
     res.setHeader("content-type", "text/html");
     res.setHeader("access-control-allow-origin", "*");
@@ -197,7 +133,7 @@ XMLHttpRequest.prototype.open = function(method, url) {
    ROOT
 ========================= */
 app.get("/", (req, res) => {
-  res.send("🔥 Hybrid proxy running");
+  res.send("🔥 Playwright-only proxy running");
 });
 
 /* =========================
