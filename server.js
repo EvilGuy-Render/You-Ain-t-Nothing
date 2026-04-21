@@ -3,6 +3,7 @@
 const express = require("express");
 const compression = require("compression");
 const { chromium } = require("playwright");
+const { request } = require("undici");
 
 const app = express();
 app.use(compression());
@@ -11,6 +12,9 @@ const PORT = process.env.PORT || 10000;
 
 let browser;
 
+/* =========================
+   BROWSER
+========================= */
 async function getBrowser() {
   if (browser) return browser;
 
@@ -18,50 +22,28 @@ async function getBrowser() {
     headless: true,
     args: [
       "--no-sandbox",
-      "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process,Translate,OptimizationHints,MediaRouter",
-      "--no-first-run",
-      "--disable-web-security",
-      "--ignore-certificate-errors",
-      "--disable-extensions",
-      "--disable-gl-drawing-for-tests",
-      "--disable-background-networking",
-      "--no-zygote",
-      "--single-process"
+      "--disable-gpu"
     ]
   });
 
   return browser;
 }
 
-const pages = [];
-const MAX_PAGES = 1;
-
-async function getPage() {
-  const b = await getBrowser();
-  let page = pages.find(p => !p.busy);
-  if (!page && pages.length < MAX_PAGES) {
-    page = await b.newPage();
-    pages.push(page);
-  }
-  if (!page) page = pages[0];
-  page.busy = true;
-  return page;
-}
-
-function release(page) {
-  if (page) page.busy = false;
-}
-
+/* =========================
+   URL FIX
+========================= */
 function fixUrl(url) {
   if (!url) return null;
+
   url = url.trim()
     .replace("https//", "https://")
     .replace("http//", "http://");
-  if (!url.startsWith("http")) url = "https://" + url;
+
+  if (!url.startsWith("http")) {
+    url = "https://" + url;
+  }
+
   try {
     return new URL(url).toString();
   } catch {
@@ -69,89 +51,159 @@ function fixUrl(url) {
   }
 }
 
-app.get("/browse", async (req, res) => {
-  let target = fixUrl(req.query.url);
-  if (!target) return res.status(400).send("Missing or invalid ?url= parameter");
+/* =========================
+   🔥 RAW STREAM (CRITICAL)
+========================= */
+app.get("/raw", async (req, res) => {
+  const target = fixUrl(req.query.url);
+  if (!target) return res.status(400).send("Bad URL");
 
-  let page;
   try {
-    page = await getPage();
-    console.log(`[Proxy] Loading with Sophos/GoGuardian stealth: ${target}`);
-
-    const origin = new URL(target).origin;
-
-    // Full Sophos + GoGuardian stealth (kept exactly from your version + minor improvements)
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      if (!window.chrome) window.chrome = { runtime: {}, app: { isInstalled: false } };
-
-      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-      Object.defineProperty(screen, 'width', { get: () => 1920 });
-      Object.defineProperty(screen, 'height', { get: () => 1080 });
-      Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
-      Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-
-      // Human-like simulation
-      setTimeout(() => {
-        if (window.dispatchEvent) {
-          const event = new MouseEvent('mousemove', { clientX: Math.random() * 100, clientY: Math.random() * 100 });
-          document.dispatchEvent(event);
-        }
-      }, 300);
-    });
-
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.setExtraHTTPHeaders({
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9'
-    });
-
-    // Faster navigation for sites like truffled.lol
-    await page.goto(target, { 
-      waitUntil: "domcontentloaded", 
-      timeout: 25000 
-    });
-
-    await page.waitForTimeout(600 + Math.random() * 400);
-
-    let html = await page.content();
-
-    // Rewriting (images, CSS, assets — kept intact)
-    html = html.replace(
-      /(src|href|action|data-src)=["']([^"']+)["']/gi,
-      (match, attr, value) => {
-        if (value.startsWith('data:') || value.startsWith('#') || value.startsWith('javascript:')) return match;
-        let full = value.startsWith('http') ? value : (value.startsWith('/') ? origin + value : origin + '/' + value);
-        return `${attr}="/browse?url=${encodeURIComponent(full)}"`;
+    const upstream = await request(target, {
+      method: "GET",
+      headers: {
+        "user-agent": "Mozilla/5.0",
+        "accept": "*/*"
       }
+    });
+
+    res.setHeader(
+      "content-type",
+      upstream.headers["content-type"] || "application/octet-stream"
     );
 
-    html = html.replace(
-      /url\(["']?([^"')]+)["']?\)/gi,
-      (match, value) => {
-        if (value.startsWith('data:')) return match;
-        let full = value.startsWith('http') ? value : (value.startsWith('/') ? origin + value : origin + '/' + value);
-        return `url("/browse?url=${encodeURIComponent(full)}")`;
-      }
-    );
+    res.setHeader("access-control-allow-origin", "*");
 
-    release(page);
-
-    res.setHeader("Content-Type", "text/html");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.send(html);
+    upstream.body.pipe(res);
 
   } catch (err) {
-    release(page);
-    console.error(`Failed to load ${target}:`, err.message);
-    res.status(500).send(`Proxy error loading ${target}<br>Site may be blocking proxies/headless browsers.<br>Error: ${err.message}`);
+    res.status(500).send("RAW error: " + err.toString());
   }
 });
 
+/* =========================
+   MAIN BROWSER ROUTE
+========================= */
+app.get("/browse", async (req, res) => {
+  const target = fixUrl(req.query.url);
+  if (!target) return res.status(400).send("Invalid URL");
+
+  const proxyBase =
+    req.protocol + "://" + req.get("host");
+
+  let page;
+
+  try {
+    const browser = await getBrowser();
+    page = await browser.newPage();
+
+    await page.goto(target, {
+      waitUntil: "domcontentloaded",
+      timeout: 25000
+    });
+
+    let html = await page.content();
+
+    /* =========================
+       REWRITE EVERYTHING → /raw
+    ========================= */
+    html = html.replace(
+      /(src|href|action)=["']([^"']+)["']/gi,
+      (match, attr, link) => {
+        if (
+          !link ||
+          link.startsWith("data:") ||
+          link.startsWith("#") ||
+          link.startsWith("javascript:")
+        ) return match;
+
+        try {
+          const abs = new URL(link, target).toString();
+          return `${attr}="${proxyBase}/raw?url=${encodeURIComponent(abs)}"`;
+        } catch {
+          return match;
+        }
+      }
+    );
+
+    /* =========================
+       CSS url()
+    ========================= */
+    html = html.replace(
+      /url\(["']?([^"')]+)["']?\)/gi,
+      (match, link) => {
+        if (link.startsWith("data:")) return match;
+
+        try {
+          const abs = new URL(link, target).toString();
+          return `url("${proxyBase}/raw?url=${encodeURIComponent(abs)}")`;
+        } catch {
+          return match;
+        }
+      }
+    );
+
+    /* =========================
+       FETCH/XHR FIX (CRITICAL)
+    ========================= */
+    const injection = `
+<script>
+const RAW = "${proxyBase}/raw?url=";
+
+const origFetch = window.fetch;
+window.fetch = function(url, opts) {
+  try {
+    if (typeof url === "string") {
+      if (!url.startsWith("data:") && !url.startsWith("blob:")) {
+        url = new URL(url, location.href).href;
+        url = RAW + encodeURIComponent(url);
+      }
+    }
+  } catch {}
+  return origFetch(url, opts);
+};
+
+const origOpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(method, url) {
+  try {
+    url = new URL(url, location.href).href;
+    url = RAW + encodeURIComponent(url);
+  } catch {}
+  return origOpen.apply(this, [method, url]);
+};
+</script>
+`;
+
+    if (html.includes("</head>")) {
+      html = html.replace("</head>", injection + "</head>");
+    } else {
+      html = injection + html;
+    }
+
+    res.setHeader("content-type", "text/html");
+    res.setHeader("access-control-allow-origin", "*");
+
+    await page.close();
+
+    res.send(html);
+
+  } catch (err) {
+    if (page) await page.close();
+    res.status(500).send("Proxy error: " + err.toString());
+  }
+});
+
+/* =========================
+   ROOT
+========================= */
+app.get("/", (req, res) => {
+  res.send("🔥 Hybrid proxy running");
+});
+
+/* =========================
+   START
+========================= */
 app.listen(PORT, async () => {
   await getBrowser();
-  console.log(`Proxy with Sophos/GoGuardian bypass running on port ${PORT}`);
+  console.log("🚀 Proxy running on port", PORT);
 });
