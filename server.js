@@ -63,48 +63,44 @@ app.get("/browse", async (req, res) => {
     const browser = await getBrowser();
     page = await browser.newPage();
 
-    const origin = new URL(target).origin;
-
     /* =========================
-       INTERCEPT EVERYTHING
-       (this replaces undici)
+       CRITICAL: DO NOT BREAK REQUESTS
     ========================= */
     await page.route("**/*", async (route) => {
-      try {
-        const request = route.request();
+      const request = route.request();
 
+      try {
         const response = await page.request.fetch(request);
 
-        const headers = response.headers();
-
-        route.fulfill({
+        await route.fulfill({
           status: response.status(),
-          headers,
+          headers: response.headers(),
           body: await response.body()
         });
-      } catch (err) {
+      } catch {
         route.continue();
       }
     });
 
     await page.goto(target, {
-      waitUntil: "domcontentloaded",
+      waitUntil: "networkidle",
       timeout: 30000
     });
 
     let html = await page.content();
 
     /* =========================
-       BASIC REWRITE
+       VERY LIGHT REWRITE ONLY
+       (navigation only, not APIs)
     ========================= */
     html = html.replace(
-      /(src|href|action)=["']([^"']+)["']/gi,
+      /(href)=["']([^"']+)["']/gi,
       (match, attr, link) => {
         if (
           !link ||
-          link.startsWith("data:") ||
           link.startsWith("#") ||
-          link.startsWith("javascript:")
+          link.startsWith("javascript:") ||
+          link.startsWith("data:")
         ) return match;
 
         try {
@@ -116,8 +112,13 @@ app.get("/browse", async (req, res) => {
       }
     );
 
-    res.setHeader("content-type", "text/html");
-    res.setHeader("access-control-allow-origin", "*");
+    /* =========================
+       HEADERS (important for WASM)
+    ========================= */
+    res.setHeader("Content-Type", "text/html");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
 
     await page.close();
 
@@ -133,7 +134,7 @@ app.get("/browse", async (req, res) => {
    ROOT
 ========================= */
 app.get("/", (req, res) => {
-  res.send("🔥 Playwright-only proxy running");
+  res.send("🔥 Full JS/WASM proxy running");
 });
 
 /* =========================
