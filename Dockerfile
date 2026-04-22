@@ -1,17 +1,11 @@
-FROM mcr.microsoft.com/playwright:v1.59.1-jammy
+FROM node:20-alpine
 
 WORKDIR /app
 
-# Force Playwright to use system-installed browsers (IMPORTANT)
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-
 COPY package*.json ./
+RUN npm ci --only=production
 
-# Install dependencies + browsers in correct order
-RUN npm install
-
-COPY . .
+COPY server.js ./
 
 EXPOSE 10000
-
 CMD ["npm", "start"]
