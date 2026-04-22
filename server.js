@@ -1,146 +1,129 @@
-"use strict";
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
 
-const express = require("express");
-const compression = require("compression");
-const { chromium } = require("playwright");
+    // === HOMEPAGE ===
+    if (url.pathname === "/" && !url.searchParams.has("url")) {
+      return new Response(`
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="UTF-8"><title>Proxy</title></head>
+        <body style="background:#111;color:#0f0;text-align:center;padding:80px;font-family:sans-serif;">
+          <h1>Full Middleman Proxy</h1>
+          <p>All assets fetched server-side (CORS + WiFi stable)</p>
+          <form>
+            <input name="url" placeholder="Paste game URL" style="width:500px;padding:12px;">
+            <button>Go</button>
+          </form>
+        </body>
+        </html>
+      `, { headers: { "Content-Type": "text/html" } });
+    }
 
-const app = express();
-app.use(compression());
+    let target = url.searchParams.get("url");
+    if (!target) return new Response("Missing URL", { status: 400 });
 
-const PORT = process.env.PORT || 10000;
+    if (!target.startsWith("http")) target = "https://" + target;
 
-let browser;
+    let targetUrl;
+    try { targetUrl = new URL(target); }
+    catch { return new Response("Bad URL", { status: 400 }); }
 
-/* =========================
-   BROWSER
-========================= */
-async function getBrowser() {
-  if (browser) return browser;
+    const origin = targetUrl.origin;
 
-  browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu"
-    ]
-  });
+    try {
+      const reqHeaders = new Headers(request.headers);
+      if (request.headers.get("range")) reqHeaders.set("range", request.headers.get("range"));
 
-  return browser;
-}
+      const response = await fetch(targetUrl, {
+        method: request.method,
+        headers: reqHeaders,
+        body: request.body,
+        redirect: "manual"
+      });
 
-/* =========================
-   URL FIX
-========================= */
-function fixUrl(url) {
-  if (!url) return null;
+      // Intercept filter block redirects
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location") || "";
+        const confirmHtml = `
+          <!DOCTYPE html>
+          <html>
+          <head><meta charset="UTF-8"><title>Redirect Confirmation</title></head>
+          <body style="background:#111;color:#0f0;text-align:center;padding:100px;font-family:sans-serif;">
+            <h2>Redirect Detected</h2>
+            <p>The site tried to redirect to:</p>
+            <p style="word-break:break-all;background:#222;padding:10px;">${location}</p>
+            <p>Do you want to follow this redirect?</p>
+            <button onclick="window.location.href='${location}'" style="padding:12px 24px;margin:10px;background:#0f0;color:#111;border:none;font-size:18px;cursor:pointer;">✅ Yes</button>
+            <button onclick="window.history.back()" style="padding:12px 24px;margin:10px;background:#333;color:#0f0;border:none;font-size:18px;cursor:pointer;">❌ No</button>
+          </body>
+          </html>
+        `;
+        return new Response(confirmHtml, { headers: { "Content-Type": "text/html" } });
+      }
 
-  url = url.trim()
-    .replace("https//", "https://")
-    .replace("http//", "http://");
+      const contentType = response.headers.get("content-type") || "";
+      const headers = new Headers(response.headers);
 
-  if (!url.startsWith("http")) {
-    url = "https://" + url;
-  }
+      headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Accept-Ranges", "bytes");
+      headers.set("Cross-Origin-Opener-Policy", "same-origin");
+      headers.set("Cross-Origin-Embedder-Policy", "require-corp");
 
-  try {
-    return new URL(url).toString();
-  } catch {
-    return null;
-  }
-}
+      headers.delete("Content-Security-Policy");
+      headers.delete("X-Frame-Options");
+      headers.delete("Content-Encoding");
 
-/* =========================
-   MAIN ROUTE
-========================= */
-app.get("/browse", async (req, res) => {
-  const target = fixUrl(req.query.url);
-  if (!target) return res.status(400).send("Invalid URL");
+      // MIME fixes for games
+      const path = targetUrl.pathname.toLowerCase();
+      if (path.endsWith(".wasm")) headers.set("Content-Type", "application/wasm");
+      if (path.endsWith(".data") || path.includes(".unityweb") || path.includes(".bundle") || path.includes(".part")) {
+        headers.set("Content-Type", "application/octet-stream");
+      }
 
-  let page;
+      // For HTML: rewrite links so all future requests go through the proxy (middleman style)
+      if (contentType.includes("text/html")) {
+        let text = await response.text();
 
-  try {
-    const browser = await getBrowser();
-    page = await browser.newPage();
+        // Rewrite all static attributes to go through proxy
+        text = text.replace(
+          /(src|href|action|data)=["']([^"']+)["']/gi,
+          (m, attr, val) => {
+            if (val.startsWith("http") || val.startsWith("data:") || val.startsWith("#")) return m;
+            const full = val.startsWith("/") ? origin + val : origin + "/" + val;
+            return `${attr}="/?url=${encodeURIComponent(full)}"`;
+          }
+        );
 
-    /* =========================
-       CRITICAL: DO NOT BREAK REQUESTS
-    ========================= */
-    await page.route("**/*", async (route) => {
-      const request = route.request();
-
-      try {
-        const response = await page.request.fetch(request);
-
-        await route.fulfill({
-          status: response.status(),
-          headers: response.headers(),
-          body: await response.body()
+        // Also rewrite CSS url() inside <style> tags if any
+        text = text.replace(/url\(([^)]+)\)/gi, (m, v) => {
+          let val = v.replace(/["']/g, "");
+          if (val.startsWith("data:") || val.startsWith("http")) return m;
+          const full = val.startsWith("/") ? origin + val : origin + "/" + val;
+          return `url("/?url=${encodeURIComponent(full)}")`;
         });
-      } catch {
-        route.continue();
+
+        return new Response(text, { headers });
       }
-    });
 
-    await page.goto(target, {
-      waitUntil: "networkidle",
-      timeout: 30000
-    });
-
-    let html = await page.content();
-
-    /* =========================
-       VERY LIGHT REWRITE ONLY
-       (navigation only, not APIs)
-    ========================= */
-    html = html.replace(
-      /(href)=["']([^"']+)["']/gi,
-      (match, attr, link) => {
-        if (
-          !link ||
-          link.startsWith("#") ||
-          link.startsWith("javascript:") ||
-          link.startsWith("data:")
-        ) return match;
-
-        try {
-          const abs = new URL(link, target).toString();
-          return `${attr}="/browse?url=${encodeURIComponent(abs)}"`;
-        } catch {
-          return match;
-        }
+      // For CSS files: rewrite url()
+      if (contentType.includes("css")) {
+        let css = await response.text();
+        css = css.replace(/url\(([^)]+)\)/gi, (m, v) => {
+          let val = v.replace(/["']/g, "");
+          if (val.startsWith("data:") || val.startsWith("http")) return m;
+          const full = val.startsWith("/") ? origin + val : origin + "/" + val;
+          return `url("/?url=${encodeURIComponent(full)}")`;
+        });
+        return new Response(css, { headers });
       }
-    );
 
-    /* =========================
-       HEADERS (important for WASM)
-    ========================= */
-    res.setHeader("Content-Type", "text/html");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
-    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+      // Everything else (JS, WASM, images, fonts, .partN, .data, etc.) is served directly
+      // This is the "middleman" part — browser only talks to the proxy
+      return new Response(response.body, { status: response.status, headers });
 
-    await page.close();
-
-    res.send(html);
-
-  } catch (err) {
-    if (page) await page.close();
-    res.status(500).send("Proxy error: " + err.toString());
+    } catch (err) {
+      return new Response("Proxy error: " + err.message, { status: 500 });
+    }
   }
-});
-
-/* =========================
-   ROOT
-========================= */
-app.get("/", (req, res) => {
-  res.send("🔥 Full JS/WASM proxy running");
-});
-
-/* =========================
-   START
-========================= */
-app.listen(PORT, async () => {
-  await getBrowser();
-  console.log("🚀 Proxy running on port", PORT);
-});
+};
