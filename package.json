@@ -1,15 +1,12 @@
 {
-  "name": "you-aint-nothing",
+  "name": "you-aint-nothing-proxy",
   "version": "1.0.0",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npx playwright install chromium"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "compression": "^1.7.4",
-    "playwright": "^1.59.1"
+    "compression": "^1.7.4"
   }
 }
