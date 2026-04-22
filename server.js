@@ -6,35 +6,52 @@ app.use(compression());
 
 const PORT = process.env.PORT || 10000;
 
+// Helper to normalize target URL
+function getTarget(req) {
+  let target = req.query.url;
+  if (!target) return null;
+
+  if (!target.startsWith("http")) target = "https://" + target;
+  try {
+    return new URL(target);
+  } catch {
+    return null;
+  }
+}
+
 // Homepage
 app.get("/", (req, res) => {
+  if (req.query.url) {
+    return handleProxy(req, res);
+  }
+
   res.send(`
     <!DOCTYPE html>
     <html>
     <head><meta charset="UTF-8"><title>Proxy</title></head>
     <body style="background:#111;color:#0f0;text-align:center;padding:80px;font-family:sans-serif;">
       <h1>Universal Game Proxy</h1>
-      <p>All assets fetched server-side (CORS + WiFi stable)</p>
-      <form action="/" method="get">
-        <input type="text" name="url" placeholder="Paste full game URL" style="width:500px;padding:12px;" required autofocus>
-        <button type="submit">Go</button>
+      <p>Compatible with Geometry Launcher + all games</p>
+      <form>
+        <input name="url" placeholder="Paste game URL" style="width:500px;padding:12px;" required autofocus>
+        <button>Go</button>
       </form>
     </body>
     </html>
   `);
 });
 
-// Main proxy route
-app.get("/", async (req, res) => {
-  let target = req.query.url;
-  if (!target) return res.status(400).send("Missing ?url= parameter");
+// Support both /browse?url=... and /?url=... 
+app.get("/browse", handleProxy);
+app.get("/", handleProxy);   // also catch root with query
 
-  if (!target.startsWith("http")) target = "https://" + target;
+async function handleProxy(req, res) {
+  const targetUrl = getTarget(req);
+  if (!targetUrl) return res.status(400).send("Missing or invalid ?url= parameter");
+
+  const origin = targetUrl.origin;
 
   try {
-    const targetUrl = new URL(target);
-    const origin = targetUrl.origin;
-
     const response = await fetch(targetUrl.toString(), {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -60,7 +77,7 @@ app.get("/", async (req, res) => {
     if (contentType.includes("text/html")) {
       let text = await response.text();
 
-      // Rewrite all asset links to go through proxy
+      // Rewrite all assets to go through proxy (supports both /browse and /?url=)
       text = text.replace(
         /(src|href|action|data)=["']([^"']+)["']/gi,
         (m, attr, val) => {
@@ -92,7 +109,7 @@ app.get("/", async (req, res) => {
     console.error(err);
     return res.status(500).send(`Proxy error: ${err.message}`);
   }
-});
+}
 
 app.listen(PORT, () => {
   console.log(`Proxy running on port ${PORT}`);
