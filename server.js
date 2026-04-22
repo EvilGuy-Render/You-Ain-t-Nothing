@@ -6,17 +6,20 @@ app.use(compression());
 
 const PORT = process.env.PORT || 10000;
 
-// Helper to normalize target URL
-function getTarget(req) {
-  let target = req.query.url;
-  if (!target) return null;
-
-  if (!target.startsWith("http")) target = "https://" + target;
-  try {
-    return new URL(target);
-  } catch {
-    return null;
+// Safe header cleaner
+function cleanHeaders(headers) {
+  const clean = new Headers();
+  for (const [key, value] of headers) {
+    if (typeof value !== "string") continue;
+    // Remove invalid characters that break Node/Express
+    const cleanValue = value.replace(/[\r\n]/g, " ").trim();
+    try {
+      clean.set(key, cleanValue);
+    } catch (e) {
+      // Skip bad headers silently
+    }
   }
+  return clean;
 }
 
 // Homepage
@@ -31,23 +34,32 @@ app.get("/", (req, res) => {
     <head><meta charset="UTF-8"><title>Proxy</title></head>
     <body style="background:#111;color:#0f0;text-align:center;padding:80px;font-family:sans-serif;">
       <h1>Universal Game Proxy</h1>
-      <p>Compatible with Geometry Launcher + all games</p>
-      <form>
-        <input name="url" placeholder="Paste game URL" style="width:500px;padding:12px;" required autofocus>
-        <button>Go</button>
+      <p>Compatible with Geometry Launcher</p>
+      <form action="/" method="get">
+        <input type="text" name="url" placeholder="Paste full game URL" style="width:500px;padding:12px;" required autofocus>
+        <button type="submit">Go</button>
       </form>
     </body>
     </html>
   `);
 });
 
-// Support both /browse?url=... and /?url=... 
+// Support both /?url=... and /browse?url=...
 app.get("/browse", handleProxy);
-app.get("/", handleProxy);   // also catch root with query
+app.get("/", handleProxy);
 
 async function handleProxy(req, res) {
-  const targetUrl = getTarget(req);
-  if (!targetUrl) return res.status(400).send("Missing or invalid ?url= parameter");
+  let target = req.query.url;
+  if (!target) return res.status(400).send("Missing ?url= parameter");
+
+  if (!target.startsWith("http")) target = "https://" + target;
+
+  let targetUrl;
+  try {
+    targetUrl = new URL(target);
+  } catch {
+    return res.status(400).send("Invalid URL");
+  }
 
   const origin = targetUrl.origin;
 
@@ -59,8 +71,9 @@ async function handleProxy(req, res) {
     });
 
     const contentType = response.headers.get("content-type") || "";
-    const headers = new Headers(response.headers);
 
+    // Clean headers to prevent "Invalid character in header content" error
+    const headers = cleanHeaders(response.headers);
     headers.set("Access-Control-Allow-Origin", "*");
     headers.set("Accept-Ranges", "bytes");
     headers.delete("Content-Security-Policy");
@@ -77,7 +90,7 @@ async function handleProxy(req, res) {
     if (contentType.includes("text/html")) {
       let text = await response.text();
 
-      // Rewrite all assets to go through proxy (supports both /browse and /?url=)
+      // Rewrite all asset links to go through proxy
       text = text.replace(
         /(src|href|action|data)=["']([^"']+)["']/gi,
         (m, attr, val) => {
